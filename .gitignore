@@ -7,3 +7,4 @@ __pycache__/
 data/processed/
 src/data/processed/labeled_observability_metrics.csv
 src/data/processed/engineered_observability_metrics.csv
+src/data/processed/
