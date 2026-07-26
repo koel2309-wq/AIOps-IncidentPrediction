@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import copy
 import random
 import time
+from typing import Any
 
 import joblib
 import matplotlib.pyplot as plt
@@ -10,27 +12,27 @@ import pandas as pd
 import torch
 
 from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    RocCurveDisplay,
     accuracy_score,
     confusion_matrix,
-    ConfusionMatrixDisplay,
     f1_score,
     precision_recall_curve,
     precision_score,
     recall_score,
     roc_auc_score,
-    RocCurveDisplay,
 )
 from sklearn.preprocessing import StandardScaler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.config import (
-    LABELED_DATA,
-    MODEL_DIR,
-    METRICS_DIR,
-    ROC_DIR,
     CONFUSION_DIR,
+    LABELED_DATA,
+    METRICS_DIR,
+    MODEL_DIR,
     RESULTS_DIR,
+    ROC_DIR,
 )
 
 
@@ -42,14 +44,21 @@ RANDOM_STATE = 42
 TARGET_COLUMN = "Target_5min"
 
 SEQUENCE_LENGTH = 10
-TRAIN_RATIO = 0.80
 
-EPOCHS = 3
+# The final 20% of each service is retained as the untouched test period.
+# The preceding 80% is divided chronologically into training and validation.
+TRAIN_TEST_SPLIT_RATIO = 0.80
+VALIDATION_FRACTION_OF_TRAINING_PERIOD = 0.20
+
+EPOCHS = 15
+EARLY_STOPPING_PATIENCE = 4
+MINIMUM_VALIDATION_IMPROVEMENT = 1e-5
+
 BATCH_SIZE = 128
 LEARNING_RATE = 0.001
 
-# Keep all positive sequences and five negative sequences
-# for every positive sequence in the training set.
+# Retain all positive training sequences and at most five negative sequences
+# for every positive sequence. Validation and test data are not undersampled.
 NEGATIVE_TO_POSITIVE_RATIO = 5
 
 FEATURE_COLUMNS = [
@@ -76,10 +85,32 @@ torch.manual_seed(RANDOM_STATE)
 
 
 # =========================================================
+# Output Directories
+# =========================================================
+
+def ensure_output_directories() -> None:
+    """Create all directories required by this module."""
+
+    required_directories = [
+        MODEL_DIR,
+        METRICS_DIR,
+        ROC_DIR,
+        CONFUSION_DIR,
+        RESULTS_DIR / "predictions",
+        RESULTS_DIR / "training_history",
+    ]
+
+    for directory in required_directories:
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+# =========================================================
 # Device Selection
 # =========================================================
 
 def get_device() -> torch.device:
+    """Use Apple Metal acceleration when available; otherwise use CPU."""
+
     if torch.backends.mps.is_available():
         return torch.device("mps")
 
@@ -98,8 +129,8 @@ def create_sequences(
     """
     Convert ordered observations into fixed-length sequences.
 
-    The target associated with each sequence is the label of the
-    final timestamp in that sequence.
+    The target associated with each sequence is the label at the final
+    timestamp in that sequence.
     """
 
     sequence_count = len(features) - sequence_length + 1
@@ -114,11 +145,7 @@ def create_sequences(
         )
 
     X_sequences = np.empty(
-        (
-            sequence_count,
-            sequence_length,
-            features.shape[1],
-        ),
+        (sequence_count, sequence_length, features.shape[1]),
         dtype=np.float32,
     )
 
@@ -151,10 +178,10 @@ def undersample_training_data(
     ratio: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Retain all positive sequences and randomly sample normal sequences.
+    Retain all positive training sequences and randomly sample negatives.
 
-    Only the training data is undersampled. Validation and test sets
-    preserve their natural class distribution.
+    Only the training subset is undersampled. Validation and test subsets
+    retain their natural class distributions.
     """
 
     positive_indices = np.where(y_train == 1)[0]
@@ -179,10 +206,7 @@ def undersample_training_data(
     )
 
     selected_indices = np.concatenate(
-        [
-            positive_indices,
-            sampled_negative_indices,
-        ]
+        [positive_indices, sampled_negative_indices]
     )
 
     rng.shuffle(selected_indices)
@@ -202,8 +226,22 @@ def prepare_lstm_data() -> tuple[
     np.ndarray,
     np.ndarray,
     np.ndarray,
+    np.ndarray,
+    np.ndarray,
     StandardScaler,
 ]:
+    """
+    Prepare chronological training, validation and test sequences.
+
+    For each service:
+      1. The first 80% forms the development period.
+      2. The final 20% forms the untouched test period.
+      3. The final 20% of the development period forms validation data.
+      4. The remaining development period forms training data.
+
+    The scaler is fitted only on the actual training observations.
+    """
+
     print(f"\nLoading data from:\n{LABELED_DATA}")
 
     if not LABELED_DATA.exists():
@@ -239,7 +277,7 @@ def prepare_lstm_data() -> tuple[
         ["Service", "Timestamp"]
     ).reset_index(drop=True)
 
-    # Fill missing telemetry independently for every service.
+    # Fill missing telemetry independently for each service.
     df[FEATURE_COLUMNS] = (
         df.groupby("Service")[FEATURE_COLUMNS]
         .transform(lambda group: group.ffill().bfill())
@@ -251,11 +289,11 @@ def prepare_lstm_data() -> tuple[
         .fillna(0)
     )
 
-    train_frames = []
-    test_frames = []
+    training_frames: list[pd.DataFrame] = []
+    validation_frames: list[pd.DataFrame] = []
+    test_frames: list[pd.DataFrame] = []
 
-    # Chronological 80/20 split per service.
-    for _, service_df in df.groupby(
+    for service, service_df in df.groupby(
         "Service",
         sort=False,
     ):
@@ -263,20 +301,51 @@ def prepare_lstm_data() -> tuple[
             "Timestamp"
         ).reset_index(drop=True)
 
-        split_index = int(
-            len(service_df) * TRAIN_RATIO
+        development_end = int(
+            len(service_df) * TRAIN_TEST_SPLIT_RATIO
         )
 
-        train_frames.append(
-            service_df.iloc[:split_index].copy()
+        development_df = service_df.iloc[
+            :development_end
+        ].copy()
+
+        service_test_df = service_df.iloc[
+            development_end:
+        ].copy()
+
+        validation_size = max(
+            SEQUENCE_LENGTH,
+            int(
+                len(development_df)
+                * VALIDATION_FRACTION_OF_TRAINING_PERIOD
+            ),
         )
 
-        test_frames.append(
-            service_df.iloc[split_index:].copy()
-        )
+        if len(development_df) <= validation_size:
+            raise ValueError(
+                f"Service '{service}' does not contain enough observations "
+                "for chronological training and validation sequences."
+            )
 
-    train_df = pd.concat(
-        train_frames,
+        service_training_df = development_df.iloc[
+            :-validation_size
+        ].copy()
+
+        service_validation_df = development_df.iloc[
+            -validation_size:
+        ].copy()
+
+        training_frames.append(service_training_df)
+        validation_frames.append(service_validation_df)
+        test_frames.append(service_test_df)
+
+    training_df = pd.concat(
+        training_frames,
+        ignore_index=True,
+    )
+
+    validation_df = pd.concat(
+        validation_frames,
         ignore_index=True,
     )
 
@@ -287,36 +356,53 @@ def prepare_lstm_data() -> tuple[
 
     scaler = StandardScaler()
 
-    # Fit only on training data to avoid leakage.
+    # Fit only on the true training period to avoid leakage.
     scaler.fit(
-        train_df[FEATURE_COLUMNS]
+        training_df[FEATURE_COLUMNS]
     )
 
-    X_train_parts = []
-    y_train_parts = []
+    X_training_parts: list[np.ndarray] = []
+    y_training_parts: list[np.ndarray] = []
 
-    X_test_parts = []
-    y_test_parts = []
+    X_validation_parts: list[np.ndarray] = []
+    y_validation_parts: list[np.ndarray] = []
+
+    X_test_parts: list[np.ndarray] = []
+    y_test_parts: list[np.ndarray] = []
 
     for service in df["Service"].unique():
-        service_train = train_df[
-            train_df["Service"] == service
-        ]
+        service_training = training_df[
+            training_df["Service"] == service
+        ].sort_values("Timestamp")
+
+        service_validation = validation_df[
+            validation_df["Service"] == service
+        ].sort_values("Timestamp")
 
         service_test = test_df[
             test_df["Service"] == service
-        ]
+        ].sort_values("Timestamp")
 
-        train_features = scaler.transform(
-            service_train[FEATURE_COLUMNS]
+        training_features = scaler.transform(
+            service_training[FEATURE_COLUMNS]
+        ).astype(np.float32)
+
+        validation_features = scaler.transform(
+            service_validation[FEATURE_COLUMNS]
         ).astype(np.float32)
 
         test_features = scaler.transform(
             service_test[FEATURE_COLUMNS]
         ).astype(np.float32)
 
-        train_targets = (
-            service_train[TARGET_COLUMN]
+        training_targets = (
+            service_training[TARGET_COLUMN]
+            .astype(np.float32)
+            .to_numpy()
+        )
+
+        validation_targets = (
+            service_validation[TARGET_COLUMN]
             .astype(np.float32)
             .to_numpy()
         )
@@ -327,9 +413,15 @@ def prepare_lstm_data() -> tuple[
             .to_numpy()
         )
 
-        X_service_train, y_service_train = create_sequences(
-            train_features,
-            train_targets,
+        X_service_training, y_service_training = create_sequences(
+            training_features,
+            training_targets,
+            SEQUENCE_LENGTH,
+        )
+
+        X_service_validation, y_service_validation = create_sequences(
+            validation_features,
+            validation_targets,
             SEQUENCE_LENGTH,
         )
 
@@ -339,16 +431,36 @@ def prepare_lstm_data() -> tuple[
             SEQUENCE_LENGTH,
         )
 
-        X_train_parts.append(X_service_train)
-        y_train_parts.append(y_service_train)
+        if len(X_service_training) == 0:
+            raise ValueError(
+                f"No training sequences were created for service '{service}'."
+            )
+
+        if len(X_service_validation) == 0:
+            raise ValueError(
+                f"No validation sequences were created for service '{service}'."
+            )
+
+        if len(X_service_test) == 0:
+            raise ValueError(
+                f"No test sequences were created for service '{service}'."
+            )
+
+        X_training_parts.append(X_service_training)
+        y_training_parts.append(y_service_training)
+
+        X_validation_parts.append(X_service_validation)
+        y_validation_parts.append(y_service_validation)
 
         X_test_parts.append(X_service_test)
         y_test_parts.append(y_service_test)
 
     return (
-        np.concatenate(X_train_parts),
+        np.concatenate(X_training_parts),
+        np.concatenate(X_validation_parts),
         np.concatenate(X_test_parts),
-        np.concatenate(y_train_parts),
+        np.concatenate(y_training_parts),
+        np.concatenate(y_validation_parts),
         np.concatenate(y_test_parts),
         scaler,
     )
@@ -359,6 +471,8 @@ def prepare_lstm_data() -> tuple[
 # =========================================================
 
 class IncidentLSTM(nn.Module):
+    """LSTM classifier for incident prediction."""
+
     def __init__(
         self,
         input_size: int,
@@ -415,7 +529,14 @@ def train_lstm(
     train_loader: DataLoader,
     validation_loader: DataLoader,
     device: torch.device,
-) -> tuple[list[float], list[float], float]:
+) -> tuple[list[float], list[float], float, int]:
+    """
+    Train the LSTM with validation-loss early stopping.
+
+    The model state associated with the lowest validation loss is restored
+    before the function returns.
+    """
+
     criterion = nn.BCEWithLogitsLoss()
 
     optimizer = torch.optim.Adam(
@@ -423,8 +544,13 @@ def train_lstm(
         lr=LEARNING_RATE,
     )
 
-    training_losses = []
-    validation_losses = []
+    training_losses: list[float] = []
+    validation_losses: list[float] = []
+
+    best_validation_loss = float("inf")
+    best_model_state: dict[str, Any] | None = None
+    best_epoch = 0
+    epochs_without_improvement = 0
 
     training_start = time.perf_counter()
 
@@ -497,15 +623,53 @@ def train_lstm(
             f"Validation Loss: {average_validation_loss:.4f}"
         )
 
+        validation_improved = (
+            average_validation_loss
+            < best_validation_loss - MINIMUM_VALIDATION_IMPROVEMENT
+        )
+
+        if validation_improved:
+            best_validation_loss = average_validation_loss
+            best_model_state = copy.deepcopy(
+                model.state_dict()
+            )
+            best_epoch = epoch + 1
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+            if (
+                epochs_without_improvement
+                >= EARLY_STOPPING_PATIENCE
+            ):
+                print(
+                    "\nEarly stopping activated after "
+                    f"{epoch + 1} epochs."
+                )
+                break
+
     training_time = (
         time.perf_counter()
         - training_start
+    )
+
+    if best_model_state is None:
+        raise RuntimeError(
+            "Training completed without producing a valid model state."
+        )
+
+    model.load_state_dict(best_model_state)
+
+    print(
+        f"\nRestored model from epoch {best_epoch} "
+        f"with validation loss {best_validation_loss:.6f}."
     )
 
     return (
         training_losses,
         validation_losses,
         training_time,
+        best_epoch,
     )
 
 
@@ -518,9 +682,11 @@ def predict_probabilities(
     data_loader: DataLoader,
     device: torch.device,
 ) -> np.ndarray:
+    """Return sigmoid probabilities for every sequence in a data loader."""
+
     model.eval()
 
-    probability_batches = []
+    probability_batches: list[np.ndarray] = []
 
     with torch.no_grad():
         for X_batch, _ in data_loader:
@@ -533,12 +699,15 @@ def predict_probabilities(
             )
 
             probability_batches.append(
-                probabilities.cpu().numpy()
+                probabilities.detach().cpu().numpy()
             )
+
+    if not probability_batches:
+        return np.empty((0,), dtype=np.float32)
 
     return np.concatenate(
         probability_batches
-    )
+    ).reshape(-1)
 
 
 # =========================================================
@@ -550,19 +719,34 @@ def select_best_threshold(
     validation_probabilities: np.ndarray,
 ) -> float:
     """
-    Select the probability threshold that maximizes validation F1-score.
+    Select the probability threshold that maximises validation F1-score.
+
+    Threshold selection uses the untouched validation set, which retains
+    its natural class distribution.
     """
+
+    y_validation_int = y_validation.astype(int).reshape(-1)
+    validation_probabilities = validation_probabilities.reshape(-1)
+
+    unique_classes = np.unique(y_validation_int)
+
+    if len(unique_classes) < 2:
+        print(
+            "\nValidation data contains only one class. "
+            "Using the default threshold of 0.5."
+        )
+        return 0.5
 
     precision_values, recall_values, thresholds = (
         precision_recall_curve(
-            y_validation.astype(int),
+            y_validation_int,
             validation_probabilities,
         )
     )
 
     if len(thresholds) == 0:
         print(
-            "No thresholds were generated. "
+            "\nNo thresholds were generated. "
             "Using the default threshold of 0.5."
         )
         return 0.5
@@ -579,7 +763,7 @@ def select_best_threshold(
     )
 
     best_index = int(
-        np.argmax(f1_values)
+        np.nanargmax(f1_values)
     )
 
     best_threshold = float(
@@ -615,7 +799,15 @@ def evaluate_lstm(
     device: torch.device,
     training_time: float,
     prediction_threshold: float,
-) -> dict[str, float]:
+    best_epoch: int,
+) -> dict[str, float | int]:
+    """
+    Evaluate the trained model and save all result artefacts.
+
+    Metrics, saved predictions and the confusion matrix are generated from
+    the same prediction array, ensuring internal consistency.
+    """
+
     inference_start = time.perf_counter()
 
     probabilities = predict_probabilities(
@@ -633,42 +825,33 @@ def evaluate_lstm(
         probabilities >= prediction_threshold
     ).astype(int)
 
-    y_test_int = y_test.astype(int)
+    y_test_int = y_test.astype(int).reshape(-1)
 
-    # --------------------------------------------------
-    # Save LSTM predictions for combined ROC comparison
-    # --------------------------------------------------
+    if len(probabilities) != len(y_test_int):
+        raise ValueError(
+            "The number of predicted probabilities does not match "
+            "the number of test labels."
+        )
 
-    predictions_dir = (
-        RESULTS_DIR / "predictions"
-    )
-
-    predictions_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    predictions_dir = RESULTS_DIR / "predictions"
 
     prediction_results = pd.DataFrame(
         {
-            "Actual": y_test_int.reshape(-1),
-            "Prediction": predictions.reshape(-1),
-            "Probability": probabilities.reshape(-1),
+            "Actual": y_test_int,
+            "Prediction": predictions,
+            "Probability": probabilities,
+            "Threshold": prediction_threshold,
         }
     )
 
-    prediction_file = (
-        predictions_dir
-        / "LSTM_predictions.csv"
-    )
+    prediction_file = predictions_dir / "LSTM_predictions.csv"
 
     prediction_results.to_csv(
         prediction_file,
         index=False,
     )
 
-    print(
-        f"\nSaved Predictions:\n{prediction_file}"
-    )
+    print(f"\nSaved Predictions:\n{prediction_file}")
 
     accuracy = accuracy_score(
         y_test_int,
@@ -693,14 +876,18 @@ def evaluate_lstm(
         zero_division=0,
     )
 
-    roc_auc = roc_auc_score(
-        y_test_int,
-        probabilities,
-    )
+    try:
+        roc_auc = roc_auc_score(
+            y_test_int,
+            probabilities,
+        )
+    except ValueError:
+        roc_auc = float("nan")
 
     matrix = confusion_matrix(
         y_test_int,
         predictions,
+        labels=[0, 1],
     )
 
     true_negative = int(matrix[0, 0])
@@ -733,38 +920,38 @@ def evaluate_lstm(
     print(f"False Negatives: {false_negative}")
     print(f"True Positives : {true_positive}")
 
-    print(
-        f"\nTraining Time : "
-        f"{training_time:.2f} seconds"
-    )
+    print(f"\nBest Epoch    : {best_epoch}")
+    print(f"Training Time : {training_time:.2f} seconds")
+    print(f"Inference Time: {inference_time:.2f} seconds")
 
-    print(
-        f"Inference Time: "
-        f"{inference_time:.2f} seconds"
-    )
-
-    metrics = {
-        "Accuracy": accuracy,
-        "Precision": precision,
-        "Recall": recall,
-        "F1": f1,
-        "ROC_AUC": roc_auc,
-        "Prediction_Threshold": prediction_threshold,
-        "Training_Time_Seconds": training_time,
-        "Inference_Time_Seconds": inference_time,
+    metrics: dict[str, float | int] = {
+        "TN": true_negative,
+        "FP": false_positive,
+        "FN": false_negative,
+        "TP": true_positive,
+        "Accuracy": float(accuracy),
+        "Precision": float(precision),
+        "Recall": float(recall),
+        "F1": float(f1),
+        "ROC_AUC": float(roc_auc),
+        "Prediction_Threshold": float(prediction_threshold),
+        "Best_Epoch": int(best_epoch),
+        "Training_Time_Seconds": float(training_time),
+        "Inference_Time_Seconds": float(inference_time),
     }
 
+    metrics_file = METRICS_DIR / "LSTM.csv"
+
     pd.DataFrame([metrics]).to_csv(
-        METRICS_DIR / "LSTM.csv",
+        metrics_file,
         index=False,
     )
 
+    print(f"\nSaved Metrics:\n{metrics_file}")
+
     display = ConfusionMatrixDisplay(
         confusion_matrix=matrix,
-        display_labels=[
-            "Normal",
-            "Incident",
-        ],
+        display_labels=["Normal", "Incident"],
     )
 
     display.plot(
@@ -774,12 +961,17 @@ def evaluate_lstm(
     plt.title("PyTorch LSTM Confusion Matrix")
     plt.tight_layout()
 
+    confusion_file = CONFUSION_DIR / "LSTM.png"
+
     plt.savefig(
-        CONFUSION_DIR / "LSTM.png",
+        confusion_file,
         dpi=300,
+        bbox_inches="tight",
     )
 
     plt.close()
+
+    print(f"\nSaved Confusion Matrix:\n{confusion_file}")
 
     RocCurveDisplay.from_predictions(
         y_test_int,
@@ -790,12 +982,17 @@ def evaluate_lstm(
     plt.title("PyTorch LSTM ROC Curve")
     plt.tight_layout()
 
+    roc_file = ROC_DIR / "LSTM.png"
+
     plt.savefig(
-        ROC_DIR / "LSTM.png",
+        roc_file,
         dpi=300,
+        bbox_inches="tight",
     )
 
     plt.close()
+
+    print(f"\nSaved ROC Curve:\n{roc_file}")
 
     return metrics
 
@@ -807,30 +1004,33 @@ def evaluate_lstm(
 def save_training_history(
     training_losses: list[float],
     validation_losses: list[float],
+    best_epoch: int,
 ) -> None:
-    history_directory = (
-        RESULTS_DIR / "training_history"
-    )
+    """Save the training and validation loss curves."""
 
-    history_directory.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    history_directory = RESULTS_DIR / "training_history"
+    completed_epochs = len(training_losses)
 
     plt.figure(figsize=(8, 5))
 
     plt.plot(
-        range(1, EPOCHS + 1),
+        range(1, completed_epochs + 1),
         training_losses,
         marker="o",
         label="Training Loss",
     )
 
     plt.plot(
-        range(1, EPOCHS + 1),
+        range(1, completed_epochs + 1),
         validation_losses,
         marker="o",
         label="Validation Loss",
+    )
+
+    plt.axvline(
+        best_epoch,
+        linestyle="--",
+        label=f"Best Epoch ({best_epoch})",
     )
 
     plt.xlabel("Epoch")
@@ -839,12 +1039,63 @@ def save_training_history(
     plt.legend()
     plt.tight_layout()
 
+    history_file = history_directory / "LSTM_loss.png"
+
     plt.savefig(
-        history_directory / "LSTM_loss.png",
+        history_file,
         dpi=300,
+        bbox_inches="tight",
     )
 
     plt.close()
+
+    print(f"\nSaved Training History:\n{history_file}")
+
+
+# =========================================================
+# Model Checkpoint
+# =========================================================
+
+def save_model_checkpoint(
+    model: IncidentLSTM,
+    scaler: StandardScaler,
+    prediction_threshold: float,
+    best_epoch: int,
+) -> None:
+    """
+    Save the model, preprocessing metadata and selected threshold.
+
+    Saving the threshold in the checkpoint allows the Streamlit dashboard
+    to use the same classification rule as the evaluation pipeline.
+    """
+
+    model_path = MODEL_DIR / "LSTM_PyTorch.pt"
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "feature_columns": FEATURE_COLUMNS,
+            "sequence_length": SEQUENCE_LENGTH,
+            "input_size": len(FEATURE_COLUMNS),
+            "hidden_size": 16,
+            "prediction_threshold": float(prediction_threshold),
+            "target_column": TARGET_COLUMN,
+            "best_epoch": int(best_epoch),
+            "random_state": RANDOM_STATE,
+        },
+        model_path,
+    )
+
+    print(f"\nSaved Model:\n{model_path}")
+
+    scaler_path = MODEL_DIR / "LSTM_scaler.joblib"
+
+    joblib.dump(
+        scaler,
+        scaler_path,
+    )
+
+    print(f"\nSaved Scaler:\n{scaler_path}")
 
 
 # =========================================================
@@ -852,9 +1103,13 @@ def save_training_history(
 # =========================================================
 
 def main() -> None:
+    """Train, validate, evaluate and save the PyTorch LSTM model."""
+
     print("=" * 60)
     print("PYTORCH LSTM INCIDENT PREDICTION")
     print("=" * 60)
+
+    ensure_output_directories()
 
     device = get_device()
 
@@ -862,49 +1117,56 @@ def main() -> None:
     print(f"Training device: {device}")
 
     (
-        X_train,
+        X_training_full,
+        X_validation,
         X_test,
-        y_train,
+        y_training_full,
+        y_validation,
         y_test,
         scaler,
     ) = prepare_lstm_data()
 
-    print("\nOriginal LSTM Dataset")
-    print(f"X_train: {X_train.shape}")
-    print(f"X_test : {X_test.shape}")
+    print("\nChronological LSTM Dataset")
+    print(f"X_training_full: {X_training_full.shape}")
+    print(f"X_validation   : {X_validation.shape}")
+    print(f"X_test         : {X_test.shape}")
 
-    print("\nOriginal Training Target Distribution")
+    print("\nNatural Training Target Distribution")
     print(
-        pd.Series(y_train.astype(int))
+        pd.Series(y_training_full.astype(int))
         .value_counts()
         .sort_index()
     )
 
-    X_train, y_train = undersample_training_data(
-        X_train,
-        y_train,
+    print("\nNatural Validation Target Distribution")
+    print(
+        pd.Series(y_validation.astype(int))
+        .value_counts()
+        .sort_index()
+    )
+
+    print("\nNatural Test Target Distribution")
+    print(
+        pd.Series(y_test.astype(int))
+        .value_counts()
+        .sort_index()
+    )
+
+    # Undersample only the actual training subset.
+    X_training, y_training = undersample_training_data(
+        X_training_full,
+        y_training_full,
         NEGATIVE_TO_POSITIVE_RATIO,
     )
 
     print("\nUndersampled Training Dataset")
-    print(f"X_train: {X_train.shape}")
+    print(f"X_training: {X_training.shape}")
 
     print(
-        pd.Series(y_train.astype(int))
+        pd.Series(y_training.astype(int))
         .value_counts()
         .sort_index()
     )
-
-    # Validation split from the undersampled training set.
-    validation_size = int(
-        len(X_train) * 0.20
-    )
-
-    X_validation = X_train[:validation_size]
-    y_validation = y_train[:validation_size]
-
-    X_training = X_train[validation_size:]
-    y_training = y_train[validation_size:]
 
     training_dataset = TensorDataset(
         torch.tensor(
@@ -939,10 +1201,14 @@ def main() -> None:
         ),
     )
 
+    data_loader_generator = torch.Generator()
+    data_loader_generator.manual_seed(RANDOM_STATE)
+
     train_loader = DataLoader(
         training_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
+        generator=data_loader_generator,
     )
 
     validation_loader = DataLoader(
@@ -969,6 +1235,7 @@ def main() -> None:
         training_losses,
         validation_losses,
         training_time,
+        best_epoch,
     ) = train_lstm(
         model=model,
         train_loader=train_loader,
@@ -976,37 +1243,10 @@ def main() -> None:
         device=device,
     )
 
-    model_path = (
-        MODEL_DIR / "LSTM_PyTorch.pt"
-    )
-
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "feature_columns": FEATURE_COLUMNS,
-            "sequence_length": SEQUENCE_LENGTH,
-            "input_size": len(FEATURE_COLUMNS),
-            "hidden_size": 16,
-        },
-        model_path,
-    )
-
-    print(f"\nSaved model to:\n{model_path}")
-
-    scaler_path = (
-        MODEL_DIR / "LSTM_scaler.joblib"
-    )
-
-    joblib.dump(
-        scaler,
-        scaler_path,
-    )
-
-    print(f"\nSaved scaler to:\n{scaler_path}")
-
     save_training_history(
-        training_losses,
-        validation_losses,
+        training_losses=training_losses,
+        validation_losses=validation_losses,
+        best_epoch=best_epoch,
     )
 
     validation_probabilities = predict_probabilities(
@@ -1020,6 +1260,13 @@ def main() -> None:
         validation_probabilities=validation_probabilities,
     )
 
+    save_model_checkpoint(
+        model=model,
+        scaler=scaler,
+        prediction_threshold=best_threshold,
+        best_epoch=best_epoch,
+    )
+
     evaluate_lstm(
         model=model,
         test_loader=test_loader,
@@ -1027,6 +1274,7 @@ def main() -> None:
         device=device,
         training_time=training_time,
         prediction_threshold=best_threshold,
+        best_epoch=best_epoch,
     )
 
     print("\nPyTorch LSTM completed successfully.")
