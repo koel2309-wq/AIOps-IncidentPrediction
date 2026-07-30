@@ -20,7 +20,7 @@ SERVICES = [
 DAYS = 30
 INTERVAL = "1min"
 
-OUTPUT_PATH = "../../data/raw"
+OUTPUT_PATH = "./data/raw"
 
 
 def generate_dataset():

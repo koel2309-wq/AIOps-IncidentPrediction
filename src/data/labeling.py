@@ -1,27 +1,22 @@
-from pathlib import Path
 import pandas as pd
+from src.config import ENGINEERED_DATA, LABELED_DATA
 
 print("=" * 60)
 print("INCIDENT PREDICTION LABELING")
 print("=" * 60)
 
 # --------------------------------------------------
-# Project Paths
+# Load Dataset
 # --------------------------------------------------
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+print(f"\nLoading dataset:\n{ENGINEERED_DATA}")
 
-INPUT_FILE = BASE_DIR / "data" / "processed" / "engineered_observability_metrics.csv"
-OUTPUT_FILE = BASE_DIR / "data" / "processed" / "labeled_observability_metrics.csv"
-
-print(f"\nLoading dataset:\n{INPUT_FILE}")
-
-df = pd.read_csv(INPUT_FILE)
+df = pd.read_csv(ENGINEERED_DATA)
 
 print(f"\nDataset Shape : {df.shape}")
 
 # --------------------------------------------------
-# Create prediction target columns
+# Create Prediction Target Columns
 # --------------------------------------------------
 
 prediction_windows = [5, 10, 15]
@@ -30,7 +25,7 @@ for window in prediction_windows:
     df[f"Target_{window}min"] = 0
 
 # --------------------------------------------------
-# Process each service independently
+# Process Each Service Independently
 # --------------------------------------------------
 
 services = df["Service"].unique()
@@ -50,12 +45,13 @@ for service in services:
             start = max(service_index.min(), incident - window)
 
             df.loc[start:incident, f"Target_{window}min"] = 1
-
 # --------------------------------------------------
-# Save dataset
+# Save Dataset
 # --------------------------------------------------
 
-df.to_csv(OUTPUT_FILE, index=False)
+LABELED_DATA.parent.mkdir(parents=True, exist_ok=True)
+
+df.to_csv(LABELED_DATA, index=False)
 
 # --------------------------------------------------
 # Summary
@@ -70,7 +66,7 @@ for window in prediction_windows:
     print(f"Target_{window}min : {positives} positive samples")
 
 print("\nSaved dataset to:")
-print(OUTPUT_FILE)
+print(LABELED_DATA)
 
 print("\nFirst Five Rows:\n")
 print(df.head())
