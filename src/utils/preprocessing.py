@@ -34,6 +34,7 @@ def load_dataset(target_column: str):
         "Timestamp",
         "Service",
         "Incident",
+        "Severity",
         "Target_5min",
         "Target_10min",
         "Target_15min",
